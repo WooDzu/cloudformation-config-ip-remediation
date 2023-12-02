@@ -3,7 +3,6 @@
 ## What does this template do?
 
 
-ChatGPT
 This document details an automated process for disabling incoming SSH (port 22) access in EC2 security groups. It is designed for both individual AWS accounts and broader AWS Organizations through Stack Sets implementation. The system establishes a Config Rule that monitors security group changes using a Lambda Function. This function assesses whether the security groups adhere to the specified rule. In cases of non-compliance, an automatic correction is executed using Systems Manager Automation, which adjusts the security group to block any SSH traffic (TCP/22).
 
 To retain any specific inbound rules, add "keep" to the rule's description.

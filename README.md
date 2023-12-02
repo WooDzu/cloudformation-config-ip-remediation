@@ -2,14 +2,12 @@
 
 ## What does this template do?
 
-This document automates revoking incoming SSH access on port 22 for EC2 security groups.
-It can be deployed on a standalone AWS account as well as across AWS Organization via Stack Sets.
-It creates a Config Rule which evaulates changes to Security Groups via Lambda Function which
-decides if the Secuirity Group is complient with the rule. Non-compliant groups can be automatically
-remediated via Systems Manager Automation that will update the security group to remove any rules
-that allow SSH traffic (TCP/22).
 
-If any of these ingress rules should be persistemd, simply add "keep" to the description of that rule.
+ChatGPT
+This document details an automated process for disabling incoming SSH (port 22) access in EC2 security groups. It is designed for both individual AWS accounts and broader AWS Organizations through Stack Sets implementation. The system establishes a Config Rule that monitors security group changes using a Lambda Function. This function assesses whether the security groups adhere to the specified rule. In cases of non-compliance, an automatic correction is executed using Systems Manager Automation, which adjusts the security group to block any SSH traffic (TCP/22).
+
+To retain any specific inbound rules, add "keep" to the rule's description.
+
 
 ![description](https://github.com/WooDzu/cloudformation-config-ip-remediation/assets/2228236/e317360f-d2fe-4612-9dea-9da3755dc101)
 

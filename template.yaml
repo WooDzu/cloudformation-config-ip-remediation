@@ -1,0 +1,587 @@
+Parameters:
+  AutomaticallyRemediate:
+    Type: String
+    Description: Automates revoking SSH ingress from Security Groups as soon as it is created
+    Default: "Yes"
+    AllowedValues:
+      - "Yes"
+      - "No"
+
+Conditions:
+  Remediate:
+    !Equals [!Ref AutomaticallyRemediate, "Yes"]
+
+Resources:
+  IamRole: 
+   Type: AWS::IAM::Role
+   Properties: 
+      RoleName: AutomationDisableIncomingSSH
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "ssm.amazonaws.com"
+                - "lambda.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+
+  IamPolicy: 
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AutomationDisableIncomingSSH
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - ec2:DescribeSecurityGroups
+              - ec2:RevokeSecurityGroupIngress
+              - config:PutEvaluations
+            Resource: "*"
+      Roles:
+        - !Ref IamRole
+
+  ConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties: 
+      ConfigRuleName: AutomationDisableIncomingSSH
+      Scope:
+          # ComplianceResourceId: 
+          #   Ref: Ec2Volume
+          ComplianceResourceTypes:
+            - AWS::EC2::SecurityGroup
+      Source:
+        Owner: "CUSTOM_LAMBDA"
+        SourceDetails: 
+          - 
+            EventSource: "aws.config"
+            MessageType: "ConfigurationItemChangeNotification"
+        SourceIdentifier: !GetAtt ConfigLambda.Arn
+    DependsOn: ConfigPermissionToCallLambda
+
+  ConfigRemediation:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      Automatic: !If [ Remediate, true, false ]
+      MaximumAutomaticAttempts: 2
+      RetryAttemptSeconds: 30
+      ConfigRuleName: !Ref ConfigRule
+      Parameters:
+          AutomationAssumeRole:
+              StaticValue:
+                Values:
+                  - !GetAtt IamRole.Arn
+      TargetId: !Ref AutomationDocument
+      TargetType: "SSM_DOCUMENT"
+
+  AutomationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: AutomationDisableIncomingSSH
+      TargetType: /AWS::EC2::SecurityGroup
+      DocumentFormat: YAML
+      DocumentType: Automation
+      Content:
+        description: |
+          #### Document Name - AutomationDisableIncomingSSH
+
+          ## What does this document do?
+          This document disables incoming SSH access on port 22 for EC2 security groups.
+
+          ## Input Parameters
+          * SecurityGroupIds: (Optional) A comma separated list of security group IDs to restrict SSH traffic for. By default all security group is current region are verified.
+          * AutomationAssumeRole: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.
+
+          ## Minimum Permissions Required
+          * `ec2:DescribeSecurityGroups` and `ec2:RevokeSecurityGroupIngress` on the target security groups
+        schemaVersion: '0.3'
+        assumeRole: '{{AutomationAssumeRole}}'
+        parameters:
+          SecurityGroupIds:
+            type: StringList
+            description: (Optional) A comma separated list of security group IDs to restrict SSH traffic for.
+            default: []
+          AutomationAssumeRole:
+            type: String
+            description: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.
+            default: ''
+            allowedPattern: '^arn:aws(-cn|-us-gov)?:iam::\d{12}:role\/[\w+=,.@_\/-]+|^$'
+        mainSteps:
+          - name: DisableIncomingSSHTemplate
+            action: 'aws:executeScript'
+            onFailure: Abort
+            isCritical: true
+            isEnd: true
+            timeoutSeconds: 600
+            description: |
+              ## DisableIncomingSSHTemplate
+              Disables all incoming traffic on port 22 on the security groups.
+              ## Inputs
+              * SecurityGroupIds: The list of targeted security group IDs.
+              ## Outputs
+              * RestrictedSecurityGroupIds: The list of the security group IDs with disabled incoming SSH on port 22.
+            inputs:
+              Runtime: python3.8
+              Handler: disable_incoming_ssh_handler
+              InputPayload:
+                SecurityGroupIds: '{{SecurityGroupIds}}'
+              Script: |
+                import boto3
+                ec2_resource = boto3.resource("ec2")
+                ec2_client = boto3.client("ec2")
+
+                def find_open_ssh_ip_in_sg(sg_description):
+                  has_filtered = False
+                  filtered_ipv4_ranges = []
+                  filtered_ipv6_ranges = []
+
+                  for rule in sg_description["IpPermissions"]:
+                    if ('FromPort' in rule and rule['FromPort'] == 22) and ('ToPort' in rule and rule['ToPort'] == 22):
+                      for ip_range in rule['IpRanges']:
+                        if 'keep' in ip_range.get('Description','').lower():
+                          continue
+                        filtered_ipv4_ranges.append(ip_range)
+                        has_filtered = True
+
+                      for ip_range in rule['Ipv6Ranges']:
+                        if 'keep' in ip_range.get('Description','').lower():
+                          continue
+                        filtered_ipv6_ranges.append(ip_range)
+                        has_filtered = True
+
+                  return has_filtered, filtered_ipv4_ranges, filtered_ipv6_ranges
+
+                def disable_incoming_ssh_handler(event, context):
+                  print(event["SecurityGroupIds"])
+                  sg_ids = event["SecurityGroupIds"] # .split(',')
+                  restricted_sg_ids = []
+                  filtered_sg_ids = []
+                  errorMsg = "N/A"
+                  successful = True
+
+                  try:
+                    if len(sg_ids) > 0:
+                      sg_descriptions = ec2_client.describe_security_groups(GroupIds=sg_id)
+                    else:
+                      sg_descriptions = ec2_client.describe_security_groups()
+
+                    for sg_description in sg_descriptions["SecurityGroups"]:
+                      sg_id = sg_description['GroupId']
+                      sg_resource = ec2_resource.SecurityGroup(sg_id)
+                      has_filtered, filtered_ipv4_ranges, filtered_ipv6_ranges = find_open_ssh_ip_in_sg(sg_description)
+
+                      if has_filtered:
+                        revoke_response = sg_resource.revoke_ingress(
+                          GroupId=sg_id,
+                          IpPermissions=[{
+                            'FromPort': 22,
+                            'IpProtocol': 'tcp',
+                            'ToPort': 22,
+                            'IpRanges': filtered_ipv4_ranges,
+                            'Ipv6Ranges': filtered_ipv6_ranges
+                          }],
+                          DryRun=False
+                        )
+                        if revoke_response and 'Return' in revoke_response and revoke_response['Return']:
+                          restricted_sg_ids.append(sg_id)
+                        else:
+                          successful = False
+                          filtered_sg_ids.append(sg_id)
+
+                  except Exception as e:
+                    errorMsg = str(e)
+                    successful = False
+                    if "InvalidGroup.NotFound" in errorMsg:
+                      errorMsg = f"One of the security groups does not exists"
+
+                  if not successful:
+                      raise Exception(
+                        "Unable to restrict one or more of the security groups filtered_sg_ids: '{}', restricted_sg_ids: '{}'. errorMsg: '{}'".format(
+                                filtered_sg_ids, restricted_sg_ids, errorMsg))
+
+                  return {
+                    "RestrictedSecurityGroupIds": restricted_sg_ids
+                  }
+
+  ConfigPermissionToCallLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt ConfigLambda.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "config.amazonaws.com"
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  ConfigLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Role: !GetAtt IamRole.Arn
+      Handler: index.handler
+      Description: Check for security group compliance
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import re
+          import json
+          import sys
+          import datetime
+          import boto3
+          import botocore
+
+          try:
+              import liblogging
+          except ImportError:
+              pass
+
+          ##############
+          # Parameters #
+          ##############
+
+          # Define the default resource to report to Config Rules
+          DEFAULT_RESOURCE_TYPE = 'AWS::EC2::Instance'
+
+          # Set to True to get the lambda to assume the Role attached on the Config Service (useful for cross-account).
+          ASSUME_ROLE_MODE = False
+
+          # Other parameters (no change needed)
+          CONFIG_ROLE_TIMEOUT_SECONDS = 900
+
+          def evaluate_compliance(event, configuration_item, valid_rule_parameters):
+              found = False
+              for rule in configuration_item['configuration'].get('ipPermissions', []):
+                print(rule)
+
+                if rule['ipProtocol'] != 'tcp':
+                  continue
+                if rule['fromPort'] != 22:
+                  continue
+
+                rules_to_keep = 0
+                rules_to_remove = 0
+
+                for ip_range in rule['ipv4Ranges']:
+                  if 'keep' in ip_range.get('description','').lower():
+                    rules_to_keep += 1
+                  else:
+                    rules_to_remove += 1
+
+                for ip_range in rule['ipv6Ranges']:
+                  if 'keep' in ip_range.get('description','').lower():
+                    rules_to_keep += 1
+                  else:
+                    rules_to_remove += 1
+                print(f"rules_to_keep={rules_to_keep} rules_to_remove={rules_to_remove}")
+
+                if rules_to_remove > 0:
+                  return build_evaluation_from_config_item(configuration_item, 'NON_COMPLIANT', annotation='This Amazon EC2 Instance has SSH allowed.')
+
+              return build_evaluation_from_config_item(configuration_item, 'COMPLIANT')
+
+          def evaluate_parameters(rule_parameters):
+              valid_rule_parameters = rule_parameters
+              return valid_rule_parameters
+
+          ####################
+          # Helper Functions #
+          ####################
+
+          # Build an error to be displayed in the logs when the parameter is invalid.
+          def build_parameters_value_error_response(ex):
+              """Return an error dictionary when the evaluate_parameters() raises a ValueError.
+
+              Keyword arguments:
+              ex -- Exception text
+              """
+              return  build_error_response(internal_error_message="Parameter value is invalid",
+                                           internal_error_details="An ValueError was raised during the validation of the Parameter value",
+                                           customer_error_code="InvalidParameterValueException",
+                                           customer_error_message=str(ex))
+
+          # This gets the client after assuming the Config service role
+          # either in the same AWS account or cross-account.
+          def get_client(service, event):
+              """Return the service boto client. It should be used instead of directly calling the client.
+
+              Keyword arguments:
+              service -- the service name used for calling the boto.client()
+              event -- the event variable given in the lambda handler
+              """
+              if not ASSUME_ROLE_MODE:
+                  return boto3.client(service)
+              credentials = get_assume_role_credentials(event["executionRoleArn"])
+              return boto3.client(service, aws_access_key_id=credentials['AccessKeyId'],
+                                  aws_secret_access_key=credentials['SecretAccessKey'],
+                                  aws_session_token=credentials['SessionToken']
+                                 )
+
+          # This generate an evaluation for config
+          def build_evaluation(resource_id, compliance_type, event, resource_type=DEFAULT_RESOURCE_TYPE, annotation=None):
+              """Form an evaluation as a dictionary. Usually suited to report on scheduled rules.
+
+              Keyword arguments:
+              resource_id -- the unique id of the resource to report
+              compliance_type -- either COMPLIANT, NON_COMPLIANT or NOT_APPLICABLE
+              event -- the event variable given in the lambda handler
+              resource_type -- the CloudFormation resource type (or AWS::::Account) to report on the rule (default DEFAULT_RESOURCE_TYPE)
+              annotation -- an annotation to be added to the evaluation (default None)
+              """
+              eval_cc = {}
+              if annotation:
+                  eval_cc['Annotation'] = annotation
+              eval_cc['ComplianceResourceType'] = resource_type
+              eval_cc['ComplianceResourceId'] = resource_id
+              eval_cc['ComplianceType'] = compliance_type
+              eval_cc['OrderingTimestamp'] = str(json.loads(event['invokingEvent'])['notificationCreationTime'])
+              return eval_cc
+
+          def build_evaluation_from_config_item(configuration_item, compliance_type, annotation=None):
+              """Form an evaluation as a dictionary. Usually suited to report on configuration change rules.
+
+              Keyword arguments:
+              configuration_item -- the configurationItem dictionary in the invokingEvent
+              compliance_type -- either COMPLIANT, NON_COMPLIANT or NOT_APPLICABLE
+              annotation -- an annotation to be added to the evaluation (default None)
+              """
+              eval_ci = {}
+              if annotation:
+                  eval_ci['Annotation'] = annotation
+              eval_ci['ComplianceResourceType'] = configuration_item['resourceType']
+              eval_ci['ComplianceResourceId'] = configuration_item['resourceId']
+              eval_ci['ComplianceType'] = compliance_type
+              eval_ci['OrderingTimestamp'] = configuration_item['configurationItemCaptureTime']
+              return eval_ci
+
+          ####################
+          # Boilerplate Code #
+          ####################
+
+          # Helper function used to validate input
+          def check_defined(reference, reference_name):
+              if not reference:
+                  raise Exception('Error: ', reference_name, 'is not defined')
+              return reference
+
+          # Check whether the message is OversizedConfigurationItemChangeNotification or not
+          def is_oversized_changed_notification(message_type):
+              check_defined(message_type, 'messageType')
+              return message_type == 'OversizedConfigurationItemChangeNotification'
+
+          # Check whether the message is a ScheduledNotification or not.
+          def is_scheduled_notification(message_type):
+              check_defined(message_type, 'messageType')
+              return message_type == 'ScheduledNotification'
+
+          # Get configurationItem using getResourceConfigHistory API
+          # in case of OversizedConfigurationItemChangeNotification
+          def get_configuration(resource_type, resource_id, configuration_capture_time):
+              result = AWS_CONFIG_CLIENT.get_resource_config_history(
+                  resourceType=resource_type,
+                  resourceId=resource_id,
+                  laterTime=configuration_capture_time,
+                  limit=1)
+              configuration_item = result['configurationItems'][0]
+              return convert_api_configuration(configuration_item)
+
+          # Convert from the API model to the original invocation model
+          def convert_api_configuration(configuration_item):
+              for k, v in configuration_item.items():
+                  if isinstance(v, datetime.datetime):
+                      configuration_item[k] = str(v)
+              configuration_item['awsAccountId'] = configuration_item['accountId']
+              configuration_item['ARN'] = configuration_item['arn']
+              configuration_item['configurationStateMd5Hash'] = configuration_item['configurationItemMD5Hash']
+              configuration_item['configurationItemVersion'] = configuration_item['version']
+              configuration_item['configuration'] = json.loads(configuration_item['configuration'])
+              if 'relationships' in configuration_item:
+                  for i in range(len(configuration_item['relationships'])):
+                      configuration_item['relationships'][i]['name'] = configuration_item['relationships'][i]['relationshipName']
+              return configuration_item
+
+          # Based on the type of message get the configuration item
+          # either from configurationItem in the invoking event
+          # or using the getResourceConfigHistiry API in getConfiguration function.
+          def get_configuration_item(invoking_event):
+              check_defined(invoking_event, 'invokingEvent')
+              if is_oversized_changed_notification(invoking_event['messageType']):
+                  configuration_item_summary = check_defined(invoking_event['configuration_item_summary'], 'configurationItemSummary')
+                  return get_configuration(configuration_item_summary['resourceType'], configuration_item_summary['resourceId'], configuration_item_summary['configurationItemCaptureTime'])
+              if is_scheduled_notification(invoking_event['messageType']):
+                  return None
+              return check_defined(invoking_event['configurationItem'], 'configurationItem')
+
+          # Check whether the resource has been deleted. If it has, then the evaluation is unnecessary.
+          def is_applicable(configuration_item, event):
+              try:
+                  check_defined(configuration_item, 'configurationItem')
+                  check_defined(event, 'event')
+              except:
+                  return True
+              status = configuration_item['configurationItemStatus']
+              event_left_scope = event['eventLeftScope']
+              if status == 'ResourceDeleted':
+                  print("Resource Deleted, setting Compliance Status to NOT_APPLICABLE.")
+              return status in ("OK", "ResourceDiscovered") and not event_left_scope
+
+          def get_assume_role_credentials(role_arn):
+              sts_client = boto3.client('sts')
+              try:
+                  assume_role_response = sts_client.assume_role(RoleArn=role_arn,
+                                                                RoleSessionName="configLambdaExecution",
+                                                                DurationSeconds=CONFIG_ROLE_TIMEOUT_SECONDS)
+                  if 'liblogging' in sys.modules:
+                      liblogging.logSession(role_arn, assume_role_response)
+                  return assume_role_response['Credentials']
+              except botocore.exceptions.ClientError as ex:
+                  # Scrub error message for any internal account info leaks
+                  print(str(ex))
+                  if 'AccessDenied' in ex.response['Error']['Code']:
+                      ex.response['Error']['Message'] = "AWS Config does not have permission to assume the IAM role."
+                  else:
+                      ex.response['Error']['Message'] = "InternalError"
+                      ex.response['Error']['Code'] = "InternalError"
+                  raise ex
+
+          # This removes older evaluation (usually useful for periodic rule not reporting on AWS::::Account).
+          def clean_up_old_evaluations(latest_evaluations, event):
+
+              cleaned_evaluations = []
+
+              old_eval = AWS_CONFIG_CLIENT.get_compliance_details_by_config_rule(
+                  ConfigRuleName=event['configRuleName'],
+                  ComplianceTypes=['COMPLIANT', 'NON_COMPLIANT'],
+                  Limit=100)
+
+              old_eval_list = []
+
+              while True:
+                  for old_result in old_eval['EvaluationResults']:
+                      old_eval_list.append(old_result)
+                  if 'NextToken' in old_eval:
+                      next_token = old_eval['NextToken']
+                      old_eval = AWS_CONFIG_CLIENT.get_compliance_details_by_config_rule(
+                          ConfigRuleName=event['configRuleName'],
+                          ComplianceTypes=['COMPLIANT', 'NON_COMPLIANT'],
+                          Limit=100,
+                          NextToken=next_token)
+                  else:
+                      break
+
+              for old_eval in old_eval_list:
+                  old_resource_id = old_eval['EvaluationResultIdentifier']['EvaluationResultQualifier']['ResourceId']
+                  newer_founded = False
+                  for latest_eval in latest_evaluations:
+                      if old_resource_id == latest_eval['ComplianceResourceId']:
+                          newer_founded = True
+                  if not newer_founded:
+                      cleaned_evaluations.append(build_evaluation(old_resource_id, "NOT_APPLICABLE", event))
+
+              return cleaned_evaluations + latest_evaluations
+
+          def handler(event, context):
+              if 'liblogging' in sys.modules:
+                  liblogging.logEvent(event)
+
+              global AWS_CONFIG_CLIENT
+
+              #print(event)
+              check_defined(event, 'event')
+              invoking_event = json.loads(event['invokingEvent'])
+              rule_parameters = {}
+              if 'ruleParameters' in event:
+                  rule_parameters = json.loads(event['ruleParameters'])
+
+              try:
+                  valid_rule_parameters = evaluate_parameters(rule_parameters)
+              except ValueError as ex:
+                  return build_parameters_value_error_response(ex)
+
+              try:
+                  AWS_CONFIG_CLIENT = get_client('config', event)
+                  if invoking_event['messageType'] in ['ConfigurationItemChangeNotification', 'ScheduledNotification', 'OversizedConfigurationItemChangeNotification']:
+                      configuration_item = get_configuration_item(invoking_event)
+                      if is_applicable(configuration_item, event):
+                          compliance_result = evaluate_compliance(event, configuration_item, valid_rule_parameters)
+                      else:
+                          compliance_result = "NOT_APPLICABLE"
+                  else:
+                      return build_internal_error_response('Unexpected message type', str(invoking_event))
+              except botocore.exceptions.ClientError as ex:
+                  if is_internal_error(ex):
+                      return build_internal_error_response("Unexpected error while completing API request", str(ex))
+                  return build_error_response("Customer error while making API request", str(ex), ex.response['Error']['Code'], ex.response['Error']['Message'])
+              except ValueError as ex:
+                  return build_internal_error_response(str(ex), str(ex))
+
+              evaluations = []
+              latest_evaluations = []
+
+              if not compliance_result:
+                  latest_evaluations.append(build_evaluation(event['accountId'], "NOT_APPLICABLE", event, resource_type='AWS::::Account'))
+                  evaluations = clean_up_old_evaluations(latest_evaluations, event)
+              elif isinstance(compliance_result, str):
+                  if configuration_item:
+                      evaluations.append(build_evaluation_from_config_item(configuration_item, compliance_result))
+                  else:
+                      evaluations.append(build_evaluation(event['accountId'], compliance_result, event, resource_type=DEFAULT_RESOURCE_TYPE))
+              elif isinstance(compliance_result, list):
+                  for evaluation in compliance_result:
+                      missing_fields = False
+                      for field in ('ComplianceResourceType', 'ComplianceResourceId', 'ComplianceType', 'OrderingTimestamp'):
+                          if field not in evaluation:
+                              print("Missing " + field + " from custom evaluation.")
+                              missing_fields = True
+
+                      if not missing_fields:
+                          latest_evaluations.append(evaluation)
+                  evaluations = clean_up_old_evaluations(latest_evaluations, event)
+              elif isinstance(compliance_result, dict):
+                  missing_fields = False
+                  for field in ('ComplianceResourceType', 'ComplianceResourceId', 'ComplianceType', 'OrderingTimestamp'):
+                      if field not in compliance_result:
+                          print("Missing " + field + " from custom evaluation.")
+                          missing_fields = True
+                  if not missing_fields:
+                      evaluations.append(compliance_result)
+              else:
+                  evaluations.append(build_evaluation_from_config_item(configuration_item, 'NOT_APPLICABLE'))
+
+              # Put together the request that reports the evaluation status
+              result_token = event['resultToken']
+              test_mode = False
+              if result_token == 'TESTMODE':
+                  # Used solely for RDK test to skip actual put_evaluation API call
+                  test_mode = True
+
+              # Invoke the Config API to report the result of the evaluation
+              evaluation_copy = []
+              evaluation_copy = evaluations[:]
+              while evaluation_copy:
+                  AWS_CONFIG_CLIENT.put_evaluations(Evaluations=evaluation_copy[:100], ResultToken=result_token, TestMode=test_mode)
+                  del evaluation_copy[:100]
+
+              # Used solely for RDK test to be able to test Lambda function
+              return evaluations
+
+          def is_internal_error(exception):
+              return ((not isinstance(exception, botocore.exceptions.ClientError)) or exception.response['Error']['Code'].startswith('5')
+                      or 'InternalError' in exception.response['Error']['Code'] or 'ServiceError' in exception.response['Error']['Code'])
+
+          def build_internal_error_response(internal_error_message, internal_error_details=None):
+              return build_error_response(internal_error_message, internal_error_details, 'InternalError', 'InternalError')
+
+          def build_error_response(internal_error_message, internal_error_details=None, customer_error_code=None, customer_error_message=None):
+              error_response = {
+                  'internalErrorMessage': internal_error_message,
+                  'internalErrorDetails': internal_error_details,
+                  'customerErrorMessage': customer_error_message,
+                  'customerErrorCode': customer_error_code
+              }
+              print(error_response)
+              return error_response
